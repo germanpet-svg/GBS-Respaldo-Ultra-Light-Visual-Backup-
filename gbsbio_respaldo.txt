@@ -1,0 +1,193 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <windows.h>
+#include <shellapi.h> // Necesario para la barra de tareas (System Tray)
+
+#define MAX_ARCHIVOS 150
+#define TIEMPO_POR_DEFECTO 300000 
+#define ID_TRAY_ICON 100
+#define WM_TRAYICON (WM_USER + 1)
+
+typedef struct {
+    char ruta_completa[512];
+    char nombre_archivo[128];
+    char directorio_origen[512];
+    char nombre_proyecto[128];
+    time_t ultima_modificacion;
+} CodigoVigilado;
+
+CodigoVigilado lista_codigos[MAX_ARCHIVOS];
+int total_archivos = 0;
+char carpeta_base_respaldos[512] = "";
+NOTIFYICONDATA nid;
+
+// Cambia el icono de la barra para indicar el estado
+void cambiar_icono_estado(int grabando) {
+    if (grabando) {
+        // Icono de Información (Verde/Azul según la versión de Windows) para avisar que graba
+        nid.hIcon = LoadIcon(NULL, IDI_INFORMATION);
+        strcpy(nid.szTip, "GBS Respaldo: ¡Guardando copia...!");
+    } else {
+        // Icono de Aplicación Estándar (Gris/Neutro) para el modo espera
+        nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+        strcpy(nid.szTip, "GBS Respaldo: Vigilando códigos");
+    }
+    Shell_NotifyIcon(NIM_MODIFY, &nid);
+}
+
+int obtener_intervalo_config() {
+    char ruta_config[512];
+    sprintf(ruta_config, "%s\\config.txt", carpeta_base_respaldos);
+    
+    FILE *f = fopen(ruta_config, "r");
+    if (f == NULL) {
+        f = fopen(ruta_config, "w");
+        if (f != NULL) {
+            fprintf(f, "# Tiempo de revision en minutos\n");
+            fprintf(f, "minutos=5\n");
+            fclose(f);
+        }
+        return TIEMPO_POR_DEFECTO;
+    }
+    
+    char linea[256];
+    int minutos = 5;
+    while (fgets(linea, sizeof(linea), f)) {
+        if (linea[0] == '#' || linea[0] == '\n') continue;
+        if (strncmp(linea, "minutos=", 8) == 0) {
+            minutos = atoi(linea + 8);
+            if (minutos <= 0) minutos = 5;
+            break;
+        }
+    }
+    fclose(f);
+    return minutos * 60 * 1000;
+}
+
+void procesar_ruta(const char *ruta_original, CodigoVigilado *archivo) {
+    strcpy(archivo->ruta_completa, ruta_original);
+    const char *ultimo_slash = strrchr(ruta_original, '\\');
+    if (ultimo_slash) {
+        strcpy(archivo->nombre_archivo, ultimo_slash + 1);
+        int longitud_dir = ultimo_slash - ruta_original;
+        strncpy(archivo->directorio_origen, ruta_original, longitud_dir);
+        archivo->directorio_origen[longitud_dir] = '\0';
+        
+        const char *slash_proyecto = strrchr(archivo->directorio_origen, '\\');
+        if (slash_proyecto) {
+            strcpy(archivo->nombre_proyecto, slash_proyecto + 1);
+        } else {
+            strcpy(archivo->nombre_proyecto, archivo->directorio_origen);
+        }
+    } else {
+        strcpy(archivo->nombre_archivo, ruta_original);
+        strcpy(archivo->directorio_origen, ".");
+        strcpy(archivo->nombre_proyecto, "General");
+    }
+}
+
+void generar_nombre_zip(char *buffer, const char *nombre_archivo) {
+    time_t t = time(NULL);
+    struct tm tm = *localtime(&t);
+    char nombre_limpio[128];
+    strcpy(nombre_limpio, nombre_archivo);
+    char *punto = strrchr(nombre_limpio, '.');
+    if (punto) *punto = '\0';
+
+    sprintf(buffer, "%s_%04d%02d%02d_%02d%02d%02d.zip", 
+            nombre_limpio, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, 
+            tm.tm_hour, tm.tm_min, tm.tm_sec);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        MessageBox(NULL, "¡Hola! Selecciona tus archivos de código y arrástralos sobre este .exe para vigilarlos.", "Guardián de Código", MB_OK | MB_ICONINFORMATION);
+        return 1;
+    }
+
+    // Asegurar que la ruta base sea exactamente al lado de donde se ejecuta el programa
+    GetModuleFileName(NULL, carpeta_base_respaldos, sizeof(carpeta_base_respaldos));
+    char *ultimo_slash = strrchr(carpeta_base_respaldos, '\\');
+    if (ultimo_slash) *ultimo_slash = '\0';
+
+    int intervalo_revision = obtener_intervalo_config();
+
+    struct stat info;
+    for (int i = 1; i < argc; i++) {
+        if (stat(argv[i], &info) == 0) {
+            if (info.st_mode & S_IFDIR) continue; 
+            procesar_ruta(argv[i], &lista_codigos[total_archivos]);
+            lista_codigos[total_archivos].ultima_modificacion = info.st_mtime;
+            total_archivos++;
+            if (total_archivos >= MAX_ARCHIVOS) break;
+        }
+    }
+
+    if (total_archivos == 0) return 0;
+
+    // --- CONFIGURACIÓN DEL ICONO EN LA BARRA DE TAREAS ---
+    memset(&nid, 0, sizeof(NOTIFYICONDATA));
+    nid.cbSize = sizeof(NOTIFYICONDATA);
+    nid.hWnd = NULL; 
+    nid.uID = ID_TRAY_ICON;
+    nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    nid.uCallbackMessage = WM_TRAYICON;
+    nid.hIcon = LoadIcon(NULL, IDI_APPLICATION); // Icono inicial neutro
+    strcpy(nid.szTip, "GBS Respaldo: Inicializando...");
+    
+    // Insertar el icono al lado del reloj
+    Shell_NotifyIcon(NIM_ADD, &nid);
+
+    // Ocultar la consola por completo
+    FreeConsole(); 
+
+    // Cambiar a estado activo
+    cambiar_icono_estado(0);
+
+    while (1) {
+        int cambio_en_este_ciclo = 0;
+
+        for (int i = 0; i < total_archivos; i++) {
+            if (stat(lista_codigos[i].ruta_completa, &info) == 0) {
+                if (info.st_mtime > lista_codigos[i].ultima_modificacion) {
+                    lista_codigos[i].ultima_modificacion = info.st_mtime;
+
+                    // Si es el primer cambio detectado en la ronda, encendemos el indicador de grabación
+                    if (!cambio_en_este_ciclo) {
+                        cambio_en_este_ciclo = 1;
+                        cambiar_icono_estado(1); // Se prende el color / cambia icono
+                    }
+
+                    // Definir la subcarpeta al lado del programa ejecutable
+                    char carpeta_proyecto[512];
+                    sprintf(carpeta_proyecto, "%s\\%s", carpeta_base_respaldos, lista_codigos[i].nombre_proyecto);
+                    CreateDirectory(carpeta_proyecto, NULL);
+
+                    char nombre_zip[256];
+                    generar_nombre_zip(nombre_zip, lista_codigos[i].nombre_archivo);
+
+                    char comando[2048];
+                    sprintf(comando, "tar -a -cf \"%s\\%s\" -C \"%s\" \"%s\"", 
+                            carpeta_proyecto, nombre_zip, lista_codigos[i].directorio_origen, lista_codigos[i].nombre_archivo);
+                    
+                    system(comando);
+                }
+            }
+        }
+
+        // Si grabó algo, esperamos 2 segundos con el icono brillante antes de regresarlo a la normalidad
+        if (cambio_en_este_ciclo) {
+            Sleep(2000); 
+            cambiar_icono_estado(0); // Vuelve a apagarse/neutral
+        }
+
+        Sleep(intervalo_revision);
+    }
+
+    // Limpieza al salir (por si acaso el bucle termina)
+    Shell_NotifyIcon(NIM_DELETE, &nid);
+    return 0;
+}

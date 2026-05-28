@@ -1,0 +1,14 @@
+# Configuración de GBS Respaldo Avanzado
+
+# Tiempo entre revisiones (minutos)
+minutos=3
+
+# Retención inteligente
+retencion_horaria=24    # Mantener 1 backup por hora durante 24 horas
+retencion_diaria=7      # Luego 1 por día durante 7 días
+max_backups=50          # Máximo total de backups por archivo
+
+# Carpetas a vigilar automáticamente (una por línea)
+# vigilar=C:\MisProyectos\AppWeb
+# vigilar=D:\Codigo\ScriptsPython
+# vigilar=E:\Documentos\Tesis
