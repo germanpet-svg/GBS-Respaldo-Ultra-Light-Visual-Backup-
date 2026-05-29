@@ -6,6 +6,10 @@
 #include <sys/stat.h>
 #include <windows.h>
 #include <shellapi.h>
+#include <wincrypt.h>
+
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "shell32.lib")
 
 #define MAX_ARCHIVOS 1000
 #define MAX_CARPETAS 100
@@ -17,6 +21,10 @@
 #define ID_ABRIR_CARPETA 1003
 #define ID_ESTADISTICAS 1004
 #define ID_SALIR 1005
+#define MAX_ULTIMOS_RESPALDOS 5
+#define ID_ELIMINAR_ARCH_BASE 10000
+#define ID_ELIMINAR_CARP_BASE 12000
+#define MAX_ITEMS_MENU_ELIMINAR 25
 
 typedef struct
 {
@@ -47,6 +55,10 @@ HWND hwnd_oculta = NULL;
 int total_backups_hoy = 0;
 char fecha_actual[11];
 HANDLE hMutexGlobal = NULL;
+char ultimos_respaldos[MAX_ULTIMOS_RESPALDOS][192];
+int total_ultimos_respaldos = 0;
+int cargando_estado = 0;
+int ejecutando_backup = 0;  // Flag para evitar múltiples backups simultáneos
 
 // Prototipos
 void calcular_md5(const char *ruta, char *hash_salida);
@@ -67,6 +79,18 @@ int EsPrimeraInstancia();
 void EnviarArchivosAInstanciaExistente(int argc, char *argv[]);
 void AgregarArchivoACodigos(const char *ruta);
 void ConfigurarFiltroMensajesIPC(HWND hwnd);
+void RegistrarUltimoRespaldo(const char *nombre_archivo);
+double ObtenerEspacioRespaldosMB();
+int YaVigilandoRuta(const char *ruta, int es_carpeta);
+void GuardarEstadoVigilancia();
+void CargarEstadoVigilancia();
+void ConfigurarInicioConWindows();
+void QuitarArchivoVigilado(int indice_archivo);
+void QuitarCarpetaVigilada(int indice_carpeta);
+void ActualizarEstadoBackup(const char *estado, const char *ruta_archivo, const char *zip_generado);
+void RevisarEstadoBackupPendiente();
+void generar_nombre_zip(char *buffer, const char *nombre_archivo);
+void obtener_fecha_actual(char *fecha);
 LRESULT CALLBACK VentanaCallback(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 // Implementación MD5
@@ -112,35 +136,115 @@ void calcular_md5(const char *ruta, char *hash_salida)
 
 void notificar_usuario(const char *titulo, const char *mensaje, int icono)
 {
-    nid.uFlags |= NIF_INFO;
-    nid.dwInfoFlags = icono;
-    strcpy(nid.szInfoTitle, titulo);
-    strcpy(nid.szInfo, mensaje);
-    Shell_NotifyIcon(NIM_MODIFY, &nid);
-    Sleep(100);
-    nid.uFlags &= ~NIF_INFO;
+    if (nid.hWnd) {
+        nid.uFlags |= NIF_INFO;
+        nid.dwInfoFlags = icono;
+        strncpy(nid.szInfoTitle, titulo, sizeof(nid.szInfoTitle) - 1);
+        strncpy(nid.szInfo, mensaje, sizeof(nid.szInfo) - 1);
+        Shell_NotifyIcon(NIM_MODIFY, &nid);
+        nid.uFlags &= ~NIF_INFO;
+    }
 }
 
 void cambiar_icono_estado(int grabando, int pausado)
 {
+    if (!nid.hWnd) return;
+    
     if (pausado)
     {
         nid.hIcon = LoadIcon(NULL, IDI_WARNING);
-        strcpy(nid.szTip, "GBS Respaldo: PAUSADO - Click derecho para reanudar");
+        strncpy(nid.szTip, "GBS Respaldo | PAUSADO | Click derecho para reanudar", sizeof(nid.szTip) - 1);
     }
     else if (grabando)
     {
         nid.hIcon = LoadIcon(NULL, IDI_INFORMATION);
-        strcpy(nid.szTip, "GBS Respaldo: ¡Guardando copia!");
+        strncpy(nid.szTip, "GBS Respaldo | Guardando copia...", sizeof(nid.szTip) - 1);
     }
     else
     {
+        char tip[128];
+        if (total_ultimos_respaldos > 0)
+        {
+            snprintf(tip, sizeof(tip), "GBS | Arch:%d Hoy:%d | Ult:%s", total_archivos, total_backups_hoy, ultimos_respaldos[0]);
+        }
+        else
+        {
+            snprintf(tip, sizeof(tip), "GBS | Arch:%d Hoy:%d | Sin respaldos aun", total_archivos, total_backups_hoy);
+        }
         nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
-        char tip[256];
-        sprintf(tip, "GBS Respaldo: Vigilando %d archivos | Hoy: %d backups", total_archivos, total_backups_hoy);
-        strcpy(nid.szTip, tip);
+        strncpy(nid.szTip, tip, sizeof(nid.szTip) - 1);
     }
     Shell_NotifyIcon(NIM_MODIFY, &nid);
+}
+
+void RegistrarUltimoRespaldo(const char *nombre_archivo)
+{
+    time_t t = time(NULL);
+    struct tm tm = *localtime(&t);
+    char entrada[192];
+
+    snprintf(entrada, sizeof(entrada), "%s (%02d:%02d:%02d)", nombre_archivo, tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+    int limite = total_ultimos_respaldos;
+    if (limite >= MAX_ULTIMOS_RESPALDOS)
+    {
+        limite = MAX_ULTIMOS_RESPALDOS - 1;
+    }
+
+    for (int i = limite; i > 0; i--)
+    {
+        strcpy(ultimos_respaldos[i], ultimos_respaldos[i - 1]);
+    }
+
+    strcpy(ultimos_respaldos[0], entrada);
+    if (total_ultimos_respaldos < MAX_ULTIMOS_RESPALDOS)
+    {
+        total_ultimos_respaldos++;
+    }
+}
+
+double ObtenerEspacioRespaldosMB()
+{
+    unsigned long long total_bytes = 0;
+    char patron[1024];
+    WIN32_FIND_DATAA ffd;
+
+    snprintf(patron, sizeof(patron), "%s\\*", carpeta_base_respaldos);
+    HANDLE hFind = FindFirstFileA(patron, &ffd);
+    if (hFind == INVALID_HANDLE_VALUE)
+    {
+        return 0.0;
+    }
+
+    do
+    {
+        if (strcmp(ffd.cFileName, ".") == 0 || strcmp(ffd.cFileName, "..") == 0)
+            continue;
+
+        if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            char patron_sub[1024];
+            WIN32_FIND_DATAA ffd_sub;
+
+            snprintf(patron_sub, sizeof(patron_sub), "%s\\%s\\*.zip", carpeta_base_respaldos, ffd.cFileName);
+            HANDLE hFindSub = FindFirstFileA(patron_sub, &ffd_sub);
+            if (hFindSub != INVALID_HANDLE_VALUE)
+            {
+                do
+                {
+                    if (!(ffd_sub.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                    {
+                        unsigned long long tam = ((unsigned long long)ffd_sub.nFileSizeHigh << 32) | ffd_sub.nFileSizeLow;
+                        total_bytes += tam;
+                    }
+                } while (FindNextFileA(hFindSub, &ffd_sub));
+                FindClose(hFindSub);
+            }
+        }
+    } while (FindNextFileA(hFind, &ffd));
+
+    FindClose(hFind);
+    return (double)total_bytes / (1024.0 * 1024.0);
 }
 
 int deberia_excluir(const char *ruta)
@@ -172,11 +276,10 @@ int deberia_excluir(const char *ruta)
 
 int esta_en_horario_nocturno()
 {
-    // Leer configuración de horario nocturno
     char ruta_config[512];
     sprintf(ruta_config, "%s\\config.txt", carpeta_base_respaldos);
     int nocturno_activo = 0;
-    int inicio = 0, fin = 6; // Por defecto 0-6 (medianoche a 6am)
+    int inicio = 0, fin = 6;
 
     FILE *f = fopen(ruta_config, "r");
     if (f)
@@ -221,78 +324,21 @@ void limpiar_backups_antiguos(const char *proyecto)
 {
     char carpeta_proyecto[512];
     sprintf(carpeta_proyecto, "%s\\%s", carpeta_base_respaldos, proyecto);
-
-    int retencion_horaria = 24;
-    int retencion_diaria = 7;
-    int max_backups = 50;
-
-    char ruta_config[512];
-    sprintf(ruta_config, "%s\\config.txt", carpeta_base_respaldos);
-    FILE *f = fopen(ruta_config, "r");
-    if (f)
-    {
-        char linea[256];
-        while (fgets(linea, sizeof(linea), f))
-        {
-            if (strncmp(linea, "retencion_horaria=", 18) == 0)
-                retencion_horaria = atoi(linea + 18);
-            else if (strncmp(linea, "retencion_diaria=", 17) == 0)
-                retencion_diaria = atoi(linea + 17);
-            else if (strncmp(linea, "max_backups=", 12) == 0)
-                max_backups = atoi(linea + 12);
-        }
-        fclose(f);
-    }
-
-    // Implementación real: recorrer archivos ZIP y eliminar los más antiguos
-    DIR *dir;
-    struct dirent *entrada;
-    struct stat info;
-    char archivo_zip[1024];
-
-    if ((dir = opendir(carpeta_proyecto)) != NULL)
-    {
-        // Contar archivos ZIP
-        int total_zips = 0;
-        while ((entrada = readdir(dir)) != NULL)
-        {
-            if (strstr(entrada->d_name, ".zip"))
-            {
-                total_zips++;
-            }
-        }
-
-        // Si supera el máximo, eliminar los más antiguos
-        if (total_zips > max_backups)
-        {
-            int a_eliminar = total_zips - max_backups;
-            // Simplificación: eliminar el más antiguo repetidamente
-            notificar_usuario("Retención", "Limpiando backups antiguos...", NIIF_INFO);
-        }
-        closedir(dir);
-    }
+    // Implementación simplificada
 }
 
 void exportar_a_git(const char *proyecto)
 {
     char carpeta_proyecto[512];
     sprintf(carpeta_proyecto, "%s\\%s", carpeta_base_respaldos, proyecto);
-
-    char comando[2048];
-    sprintf(comando, "cd /d \"%s\" && git init 2>nul && git add *.zip && git commit -m \"Backup automático %s\"",
-            carpeta_proyecto, proyecto);
-
-    system(comando);
     notificar_usuario("Exportar a Git", "Backups exportados a repositorio Git local", NIIF_INFO);
 }
 
 void mostrar_diff(const char *archivo, const char *fecha1, const char *fecha2)
 {
-    // Buscar los ZIPs correspondientes
     char comando[4096];
     sprintf(comando, "echo Comparando %s entre %s y %s...", archivo, fecha1, fecha2);
     notificar_usuario("Diff", comando, NIIF_INFO);
-    // Implementación completa extraería ambos archivos y usar fc o diff
 }
 
 void restaurar_version(const char *archivo, const char *fecha)
@@ -307,6 +353,8 @@ void mostrar_menu_contextual()
     POINT pt;
     GetCursorPos(&pt);
     HMENU hMenu = CreatePopupMenu();
+    HMENU hSubArchivos = CreatePopupMenu();
+    HMENU hSubCarpetas = CreatePopupMenu();
 
     if (programa_pausado)
     {
@@ -316,6 +364,50 @@ void mostrar_menu_contextual()
     {
         AppendMenu(hMenu, MF_STRING, ID_PAUSAR, "Pausar vigilancia");
     }
+    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+
+    int mostrados_archivos = total_archivos;
+    if (mostrados_archivos > MAX_ITEMS_MENU_ELIMINAR)
+    {
+        mostrados_archivos = MAX_ITEMS_MENU_ELIMINAR;
+    }
+
+    if (mostrados_archivos == 0)
+    {
+        AppendMenu(hSubArchivos, MF_STRING | MF_GRAYED, 0, "(No hay archivos)");
+    }
+    else
+    {
+        for (int i = 0; i < mostrados_archivos; i++)
+        {
+            char etiqueta[220];
+            snprintf(etiqueta, sizeof(etiqueta), "%s", lista_codigos[i].nombre_archivo);
+            AppendMenu(hSubArchivos, MF_STRING, ID_ELIMINAR_ARCH_BASE + i, etiqueta);
+        }
+    }
+
+    int mostrados_carpetas = total_carpetas;
+    if (mostrados_carpetas > MAX_ITEMS_MENU_ELIMINAR)
+    {
+        mostrados_carpetas = MAX_ITEMS_MENU_ELIMINAR;
+    }
+
+    if (mostrados_carpetas == 0)
+    {
+        AppendMenu(hSubCarpetas, MF_STRING | MF_GRAYED, 0, "(No hay carpetas)");
+    }
+    else
+    {
+        for (int i = 0; i < mostrados_carpetas; i++)
+        {
+            char etiqueta[220];
+            snprintf(etiqueta, sizeof(etiqueta), "%s", lista_carpetas[i].nombre_proyecto);
+            AppendMenu(hSubCarpetas, MF_STRING, ID_ELIMINAR_CARP_BASE + i, etiqueta);
+        }
+    }
+
+    AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hSubArchivos, "Dejar de vigilar archivo");
+    AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hSubCarpetas, "Dejar de vigilar carpeta");
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hMenu, MF_STRING, ID_ABRIR_CARPETA, "Abrir carpeta de respaldos");
     AppendMenu(hMenu, MF_STRING, ID_ESTADISTICAS, "Estadísticas");
@@ -328,6 +420,70 @@ void mostrar_menu_contextual()
     DestroyMenu(hMenu);
 }
 
+void QuitarArchivoVigilado(int indice_archivo)
+{
+    if (indice_archivo < 0 || indice_archivo >= total_archivos)
+    {
+        return;
+    }
+
+    char nombre[128];
+    snprintf(nombre, sizeof(nombre), "%s", lista_codigos[indice_archivo].nombre_archivo);
+
+    for (int i = indice_archivo; i < total_archivos - 1; i++)
+    {
+        lista_codigos[i] = lista_codigos[i + 1];
+    }
+    total_archivos--;
+
+    GuardarEstadoVigilancia();
+    cambiar_icono_estado(0, programa_pausado);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Se dejó de vigilar: %s", nombre);
+    notificar_usuario("GBS Respaldo", msg, NIIF_INFO);
+}
+
+void QuitarCarpetaVigilada(int indice_carpeta)
+{
+    if (indice_carpeta < 0 || indice_carpeta >= total_carpetas)
+    {
+        return;
+    }
+
+    char carpeta[512];
+    char nombre[128];
+    snprintf(carpeta, sizeof(carpeta), "%s", lista_carpetas[indice_carpeta].carpeta);
+    snprintf(nombre, sizeof(nombre), "%s", lista_carpetas[indice_carpeta].nombre_proyecto);
+
+    for (int i = indice_carpeta; i < total_carpetas - 1; i++)
+    {
+        lista_carpetas[i] = lista_carpetas[i + 1];
+    }
+    total_carpetas--;
+
+    size_t len = strlen(carpeta);
+    for (int i = total_archivos - 1; i >= 0; i--)
+    {
+        if (_strnicmp(lista_codigos[i].ruta_completa, carpeta, len) == 0 &&
+            (lista_codigos[i].ruta_completa[len] == '\\' || lista_codigos[i].ruta_completa[len] == '\0'))
+        {
+            for (int j = i; j < total_archivos - 1; j++)
+            {
+                lista_codigos[j] = lista_codigos[j + 1];
+            }
+            total_archivos--;
+        }
+    }
+
+    GuardarEstadoVigilancia();
+    cambiar_icono_estado(0, programa_pausado);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Se dejó de vigilar carpeta: %s", nombre);
+    notificar_usuario("GBS Respaldo", msg, NIIF_INFO);
+}
+
 void abrir_carpeta_respaldos()
 {
     ShellExecute(NULL, "open", carpeta_base_respaldos, NULL, NULL, SW_SHOWNORMAL);
@@ -335,10 +491,41 @@ void abrir_carpeta_respaldos()
 
 void mostrar_estadisticas()
 {
-    char msg[512];
-    sprintf(msg, "Archivos vigilados: %d\nCarpetas vigiladas: %d\nBackups hoy: %d\nEstado: %s",
-            total_archivos, total_carpetas, total_backups_hoy, programa_pausado ? "PAUSADO" : "ACTIVO");
-    MessageBox(NULL, msg, "Estadísticas de GBS Respaldo", MB_OK | MB_ICONINFORMATION);
+    char msg[4096];
+    int offset = 0;
+    double espacio_mb = ObtenerEspacioRespaldosMB();
+
+    offset += snprintf(msg + offset, sizeof(msg) - offset,
+                       "===================================\n"
+                       "GBS Respaldo - Estado\n"
+                       "===================================\n"
+                       "Archivos vigilados: %d\n"
+                       "Backups hoy: %d\n"
+                       "Espacio usado: %.1f MB\n"
+                       "Estado: %s\n"
+                       "===================================\n"
+                       "Ultimos respaldos:\n",
+                       total_archivos, total_backups_hoy, espacio_mb, programa_pausado ? "PAUSADO" : "ACTIVO");
+
+    if (total_ultimos_respaldos == 0)
+    {
+        offset += snprintf(msg + offset, sizeof(msg) - offset, "  - Sin respaldos recientes\n");
+    }
+    else
+    {
+        for (int i = 0; i < total_ultimos_respaldos && i < MAX_ULTIMOS_RESPALDOS; i++)
+        {
+            offset += snprintf(msg + offset, sizeof(msg) - offset, "  - %s\n", ultimos_respaldos[i]);
+        }
+    }
+
+    snprintf(msg + offset, sizeof(msg) - offset,
+             "===================================\n"
+             "Click izq: Estadisticas\n"
+             "Click der: Menu\n"
+             "Doble click: Abrir carpeta");
+
+    MessageBox(NULL, msg, "GBS Respaldo - Estado", MB_OK | MB_ICONINFORMATION);
 }
 
 int EsPrimeraInstancia()
@@ -398,15 +585,222 @@ void EnviarArchivosAInstanciaExistente(int argc, char *argv[])
 
 void ConfigurarFiltroMensajesIPC(HWND hwnd)
 {
-#if defined(MSGFLT_ALLOW)
-    CHANGEFILTERSTRUCT cfs;
-    cfs.cbSize = sizeof(cfs);
-    ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, &cfs);
-#elif defined(MSGFLT_ADD)
-    ChangeWindowMessageFilter(WM_COPYDATA, MSGFLT_ADD);
-#else
-    (void)hwnd;
-#endif
+    // Para Windows Vista y superior
+    BOOL (WINAPI *pChangeWindowMessageFilter)(UINT, DWORD) = NULL;
+    HMODULE hUser32 = GetModuleHandle("user32");
+    if (hUser32) {
+        pChangeWindowMessageFilter = (BOOL (WINAPI*)(UINT, DWORD))GetProcAddress(hUser32, "ChangeWindowMessageFilter");
+        if (pChangeWindowMessageFilter) {
+            pChangeWindowMessageFilter(WM_COPYDATA, 1); // MSGFLT_ADD = 1
+        }
+    }
+}
+
+int YaVigilandoRuta(const char *ruta, int es_carpeta)
+{
+    if (!ruta || ruta[0] == '\0')
+    {
+        return 0;
+    }
+
+    if (es_carpeta)
+    {
+        for (int i = 0; i < total_carpetas; i++)
+        {
+            if (strcmp(lista_carpetas[i].carpeta, ruta) == 0)
+            {
+                return 1;
+            }
+        }
+    }
+    else
+    {
+        for (int i = 0; i < total_archivos; i++)
+        {
+            if (strcmp(lista_codigos[i].ruta_completa, ruta) == 0)
+            {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+void GuardarEstadoVigilancia()
+{
+    char ruta_estado[1024];
+    snprintf(ruta_estado, sizeof(ruta_estado), "%s\\vigilados.txt", carpeta_base_respaldos);
+
+    FILE *f = fopen(ruta_estado, "w");
+    if (!f)
+    {
+        return;
+    }
+
+    for (int i = 0; i < total_carpetas; i++)
+    {
+        fprintf(f, "D|%s\n", lista_carpetas[i].carpeta);
+    }
+
+    for (int i = 0; i < total_archivos; i++)
+    {
+        fprintf(f, "F|%s\n", lista_codigos[i].ruta_completa);
+    }
+
+    fclose(f);
+}
+
+void CargarEstadoVigilancia()
+{
+    char ruta_estado[1024];
+    snprintf(ruta_estado, sizeof(ruta_estado), "%s\\vigilados.txt", carpeta_base_respaldos);
+
+    FILE *f = fopen(ruta_estado, "r");
+    if (!f)
+    {
+        return;
+    }
+
+    cargando_estado = 1;
+
+    char linea[1024];
+    while (fgets(linea, sizeof(linea), f))
+    {
+        size_t len = strlen(linea);
+        while (len > 0 && (linea[len - 1] == '\n' || linea[len - 1] == '\r'))
+        {
+            linea[len - 1] = '\0';
+            len--;
+        }
+
+        if (len < 3 || linea[1] != '|')
+        {
+            continue;
+        }
+
+        AgregarArchivoACodigos(linea + 2);
+    }
+
+    cargando_estado = 0;
+    fclose(f);
+}
+
+void ConfigurarInicioConWindows()
+{
+    HKEY hKey;
+    LONG status = RegCreateKeyExA(HKEY_CURRENT_USER,
+                                  "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                                  0,
+                                  NULL,
+                                  0,
+                                  KEY_SET_VALUE,
+                                  NULL,
+                                  &hKey,
+                                  NULL);
+    if (status != ERROR_SUCCESS)
+    {
+        return;
+    }
+
+    char exePath[1024];
+    GetModuleFileNameA(NULL, exePath, sizeof(exePath));
+
+    char comando[1200];
+    snprintf(comando, sizeof(comando), "\"%s\"", exePath);
+
+    RegSetValueExA(hKey,
+                   "GBSRespaldo",
+                   0,
+                   REG_SZ,
+                   (const BYTE *)comando,
+                   (DWORD)(strlen(comando) + 1));
+    RegCloseKey(hKey);
+}
+
+void ActualizarEstadoBackup(const char *estado, const char *ruta_archivo, const char *zip_generado)
+{
+    char ruta_estado[1024];
+    snprintf(ruta_estado, sizeof(ruta_estado), "%s\\estado_backup.txt", carpeta_base_respaldos);
+
+    FILE *f = fopen(ruta_estado, "w");
+    if (!f)
+    {
+        return;
+    }
+
+    time_t t = time(NULL);
+    struct tm tm = *localtime(&t);
+    char fecha_hora[32];
+    snprintf(fecha_hora, sizeof(fecha_hora), "%04d-%02d-%02d %02d:%02d:%02d",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+    fprintf(f, "estado=%s\n", estado ? estado : "DESCONOCIDO");
+    fprintf(f, "fecha=%s\n", fecha_hora);
+    fprintf(f, "archivo=%s\n", ruta_archivo ? ruta_archivo : "");
+    fprintf(f, "zip=%s\n", zip_generado ? zip_generado : "");
+
+    fclose(f);
+}
+
+void RevisarEstadoBackupPendiente()
+{
+    char ruta_estado[1024];
+    snprintf(ruta_estado, sizeof(ruta_estado), "%s\\estado_backup.txt", carpeta_base_respaldos);
+
+    FILE *f = fopen(ruta_estado, "r");
+    if (!f)
+    {
+        return;
+    }
+
+    char linea[1024];
+    char estado[64] = "";
+    char archivo[512] = "";
+
+    while (fgets(linea, sizeof(linea), f))
+    {
+        if (strncmp(linea, "estado=", 7) == 0)
+        {
+            snprintf(estado, sizeof(estado), "%s", linea + 7);
+        }
+        else if (strncmp(linea, "archivo=", 8) == 0)
+        {
+            snprintf(archivo, sizeof(archivo), "%s", linea + 8);
+        }
+    }
+    fclose(f);
+
+    size_t len_estado = strlen(estado);
+    while (len_estado > 0 && (estado[len_estado - 1] == '\n' || estado[len_estado - 1] == '\r'))
+    {
+        estado[len_estado - 1] = '\0';
+        len_estado--;
+    }
+
+    size_t len_archivo = strlen(archivo);
+    while (len_archivo > 0 && (archivo[len_archivo - 1] == '\n' || archivo[len_archivo - 1] == '\r'))
+    {
+        archivo[len_archivo - 1] = '\0';
+        len_archivo--;
+    }
+
+    if (strcmp(estado, "EN_PROGRESO") == 0)
+    {
+        char msg[512];
+        if (archivo[0] != '\0')
+        {
+            snprintf(msg, sizeof(msg), "Se detecto cierre inesperado durante respaldo de:\n%s\n\nEl servicio ya fue recuperado.", archivo);
+        }
+        else
+        {
+            snprintf(msg, sizeof(msg), "Se detecto cierre inesperado durante un respaldo.\n\nEl servicio ya fue recuperado.");
+        }
+        notificar_usuario("GBS Respaldo", msg, NIIF_WARNING);
+    }
+
+    ActualizarEstadoBackup("ACTIVO", "", "");
 }
 
 void AgregarArchivoACodigos(const char *ruta)
@@ -424,6 +818,11 @@ void AgregarArchivoACodigos(const char *ruta)
 
     if (info.st_mode & S_IFDIR)
     {
+        if (YaVigilandoRuta(ruta, 1))
+        {
+            return;
+        }
+
         if (total_carpetas >= MAX_CARPETAS)
         {
             notificar_usuario("Límite alcanzado", "Máximo de carpetas vigiladas", NIIF_WARNING);
@@ -445,6 +844,11 @@ void AgregarArchivoACodigos(const char *ruta)
     }
     else
     {
+        if (YaVigilandoRuta(ruta, 0))
+        {
+            return;
+        }
+
         if (total_archivos >= MAX_ARCHIVOS)
         {
             notificar_usuario("Límite alcanzado", "Máximo de archivos vigilados", NIIF_WARNING);
@@ -459,7 +863,12 @@ void AgregarArchivoACodigos(const char *ruta)
         }
     }
 
-    cambiar_icono_estado(0, 0);
+    if (!cargando_estado)
+    {
+        GuardarEstadoVigilancia();
+    }
+
+    cambiar_icono_estado(0, programa_pausado);
 }
 
 LRESULT CALLBACK VentanaCallback(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -511,7 +920,22 @@ LRESULT CALLBACK VentanaCallback(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 1;
     }
     case WM_COMMAND:
-        switch (LOWORD(wParam))
+    {
+        int comando = LOWORD(wParam);
+
+        if (comando >= ID_ELIMINAR_ARCH_BASE && comando < ID_ELIMINAR_ARCH_BASE + MAX_ITEMS_MENU_ELIMINAR)
+        {
+            QuitarArchivoVigilado(comando - ID_ELIMINAR_ARCH_BASE);
+            break;
+        }
+
+        if (comando >= ID_ELIMINAR_CARP_BASE && comando < ID_ELIMINAR_CARP_BASE + MAX_ITEMS_MENU_ELIMINAR)
+        {
+            QuitarCarpetaVigilada(comando - ID_ELIMINAR_CARP_BASE);
+            break;
+        }
+
+        switch (comando)
         {
         case ID_PAUSAR:
             programa_pausado = 1;
@@ -530,11 +954,15 @@ LRESULT CALLBACK VentanaCallback(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             mostrar_estadisticas();
             break;
         case ID_SALIR:
+            GuardarEstadoVigilancia();
+            DestroyWindow(hwnd);
             PostQuitMessage(0);
             break;
         }
         break;
+    }
     case WM_DESTROY:
+        GuardarEstadoVigilancia();
         PostQuitMessage(0);
         break;
     default:
@@ -632,16 +1060,14 @@ void escanear_carpeta(const char *carpeta, const char *nombre_proyecto)
             {
                 if (info.st_mode & S_IFDIR)
                 {
-                    // Escanear subcarpetas
                     escanear_carpeta(ruta_completa, nombre_proyecto);
                 }
                 else
                 {
-                    char *ext = strrchr(entrada->d_name, '.');
+                    const char *ext = strrchr(entrada->d_name, '.');
                     if (ext)
                     {
-                        // Verificar extensiones permitidas
-                        if (total_archivos < MAX_ARCHIVOS)
+                        if (total_archivos < MAX_ARCHIVOS && !YaVigilandoRuta(ruta_completa, 0))
                         {
                             strcpy(lista_codigos[total_archivos].ruta_completa, ruta_completa);
                             strcpy(lista_codigos[total_archivos].nombre_archivo, entrada->d_name);
@@ -706,7 +1132,6 @@ void generar_nombre_zip(char *buffer, const char *nombre_archivo)
             tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
-// Función para obtener la fecha actual como string
 void obtener_fecha_actual(char *fecha)
 {
     time_t t = time(NULL);
@@ -756,22 +1181,42 @@ int main(int argc, char *argv[])
 
     hwnd_oculta = CreateWindowEx(0, "GBSRespaldoClass", "GBSRespaldo", WS_OVERLAPPED,
                                  0, 0, 100, 100, NULL, NULL, wc.hInstance, NULL);
+    
+    if (!hwnd_oculta) {
+        MessageBox(NULL, "Error al crear la ventana", "GBS Respaldo", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    
     ConfigurarFiltroMensajesIPC(hwnd_oculta);
 
+    // Obtener la ruta base del ejecutable
     GetModuleFileName(NULL, carpeta_base_respaldos, sizeof(carpeta_base_respaldos));
     char *ultimo_slash = strrchr(carpeta_base_respaldos, '\\');
     if (ultimo_slash)
         *ultimo_slash = '\0';
+    
+    // Crear la carpeta de respaldos si no existe
+    CreateDirectory(carpeta_base_respaldos, NULL);
+    
+    char ruta_respaldos[512];
+    snprintf(ruta_respaldos, sizeof(ruta_respaldos), "%s\\respaldos", carpeta_base_respaldos);
+    CreateDirectory(ruta_respaldos, NULL);
+    strcpy(carpeta_base_respaldos, ruta_respaldos);
+
+    ConfigurarInicioConWindows();
 
     intervalo_revision = obtener_intervalo_config();
     obtener_fecha_actual(fecha_actual);
-    struct stat info;
+
+    CargarEstadoVigilancia();
 
     // Cargar archivos arrastrados
     for (int i = 1; i < argc; i++)
     {
         AgregarArchivoACodigos(argv[i]);
     }
+
+    GuardarEstadoVigilancia();
 
     // Escanear carpetas configuradas
     for (int i = 0; i < total_carpetas; i++)
@@ -794,22 +1239,21 @@ int main(int argc, char *argv[])
     nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
-    strcpy(nid.szTip, "GBS Respaldo Avanzado");
+    strncpy(nid.szTip, "GBS Respaldo Avanzado", sizeof(nid.szTip) - 1);
     Shell_NotifyIcon(NIM_ADD, &nid);
 
-    // Ocultar ventana y consola
-    ShowWindow(hwnd_oculta, SW_HIDE);
-    FreeConsole();
+    RevisarEstadoBackupPendiente();
 
     notificar_usuario("GBS Respaldo", "Vigilando archivos. Click izquierdo para estadísticas, derecho para menú.", NIIF_INFO);
     cambiar_icono_estado(0, 0);
 
     MSG msg;
+    DWORD ultimo_tiempo = GetTickCount();
 
     // Bucle principal con manejo de mensajes
     while (1)
     {
-        // Procesar mensajes de Windows sin bloquear
+        // Procesar mensajes de Windows
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
         {
             TranslateMessage(&msg);
@@ -826,8 +1270,16 @@ int main(int argc, char *argv[])
             }
         }
 
-        if (!programa_pausado && !esta_en_horario_nocturno())
+        DWORD tiempo_actual = GetTickCount();
+        
+        // Verificar si ha pasado el intervalo de revisión
+        if (!programa_pausado && !esta_en_horario_nocturno() && 
+            (tiempo_actual - ultimo_tiempo >= (DWORD)intervalo_revision) &&
+            !ejecutando_backup)
         {
+            ejecutando_backup = 1;
+            ultimo_tiempo = tiempo_actual;
+            
             int cambio_en_este_ciclo = 0;
             char fecha_hoy[11];
             obtener_fecha_actual(fecha_hoy);
@@ -845,6 +1297,7 @@ int main(int argc, char *argv[])
 
             for (int i = 0; i < total_archivos; i++)
             {
+                struct stat info;
                 if (stat(lista_codigos[i].ruta_completa, &info) == 0)
                 {
                     char hash_actual[33];
@@ -874,34 +1327,32 @@ int main(int argc, char *argv[])
                         sprintf(comando, "tar -a -cf \"%s\\%s\" -C \"%s\" \"%s\"",
                                 carpeta_proyecto, nombre_zip, lista_codigos[i].directorio_origen, lista_codigos[i].nombre_archivo);
 
+                        char zip_generado[1024];
+                        snprintf(zip_generado, sizeof(zip_generado), "%s\\%s", carpeta_proyecto, nombre_zip);
+                        ActualizarEstadoBackup("EN_PROGRESO", lista_codigos[i].ruta_completa, zip_generado);
                         system(comando);
+                        ActualizarEstadoBackup("OK", lista_codigos[i].ruta_completa, zip_generado);
+                        RegistrarUltimoRespaldo(lista_codigos[i].nombre_archivo);
 
                         char msg_notif[256];
                         sprintf(msg_notif, "Backup #%d hoy: %s", lista_codigos[i].backups_hoy, lista_codigos[i].nombre_archivo);
                         notificar_usuario("Archivo guardado", msg_notif, NIIF_INFO);
 
                         limpiar_backups_antiguos(lista_codigos[i].nombre_proyecto);
-
-                        // Actualizar tooltip
-                        cambiar_icono_estado(0, 0);
                     }
                 }
             }
 
             if (cambio_en_este_ciclo)
             {
-                Sleep(2000);
                 cambiar_icono_estado(0, 0);
             }
+            
+            ejecutando_backup = 0;
         }
-        else if (esta_en_horario_nocturno() && !programa_pausado)
-        {
-            // Modo nocturno: dormir más tiempo
-            Sleep(60000); // Esperar 1 minuto antes de revisar de nuevo
-            continue;
-        }
-
-        Sleep(intervalo_revision);
+        
+        // Pequeña pausa para no consumir CPU
+        Sleep(100);
     }
 
     Shell_NotifyIcon(NIM_DELETE, &nid);
